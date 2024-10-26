@@ -275,17 +275,26 @@ let compute_collatz (size : int) =
   Log.info "Number of domains used for computation: %d." num_domains;
   Log.info "Starting the computation...";
 
+  (* see [1] for the calculation of the third iterate of the C(n) function *)
+  let first_values = [| 0; 1; 7; 2; 5; 8; 16; 3 |] in
+
+  let coefs =
+    [| (1, 0); (6, 2); (6, 4); (36, 20); (6, 8); (6, 2); (6, 4); (36, 20) |]
+  in
+
   (* this is the number of "in-memory" data allocations we're going to do *)
   let niter =
     if size < max_array_size then 1 else (size / max_array_size) + 1
   in
   let rec collatz n (delta : int) =
-    if n = 1 then 0
+    if n - 1 < 8 then first_values.(n - 1)
     else if Memory.mem memory (n - 1) then Memory.get memory (n - 1)
     else if Dataset.mem db n then Dataset.get db n
     else
-      let n' = if n mod 2 = 0 then n / 2 else (3 * n) + 1 in
-      1 + collatz n' delta
+      let m = n mod 8 in
+      let a, b = coefs.(m) in
+      let n' = ((a * n) + b) / 8 in
+      3 + collatz n' delta
   in
 
   let process f =
@@ -311,7 +320,8 @@ let compute_collatz (size : int) =
       Task.teardown_pool pool;
       Progress.finish progress;
 
-      Dataset.set_batch db batch
+      Dataset.set_batch db batch;
+      Gc.full_major ()
     done
   in
 
