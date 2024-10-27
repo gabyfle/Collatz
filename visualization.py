@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 
@@ -34,5 +35,5 @@ data = pd.read_csv("dataset.csv")
 x = data["n"]
 y = data["steps"]
 
-# plot_func(x, y, "C(N)", "N", "Steps", "steps.svg")
-plot_hist(y, "Histogram of steps", "Steps", "Frequency", "hist.svg")
+plot_func(x, y, "C(N)", "N", "Steps", "steps.svg")
+# plot_hist(y, "Histogram of steps", "Steps", "Frequency", "hist.svg")

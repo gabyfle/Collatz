@@ -48,30 +48,97 @@ module Progress = struct
          "\r\027[K[\027[1;32m%3.0f%%\027[0m] Processing: %d/%d (\027[1;33m%.2f \
           OP/s\027[0m)%!"
          percentage (new_count + 1) t.total)
-        (float_of_int (new_count + 1) /. (now -. t.starting_time))
+        (float_of_int (new_count + 1) /. (now -. t.starting_time));
+    flush stdout
 
   let finish t =
     Printf.printf
       "\r\027[K[\027[1;32m100%%\027[0m] Completed: %d/%d%! (\027[1;33m%.2f \
        OP/s\027[0m)\n"
       t.total t.total
-      (float_of_int t.total /. (Unix.gettimeofday () -. t.starting_time))
+      (float_of_int t.total /. (Unix.gettimeofday () -. t.starting_time));
+    flush stdout
 end
 
 module type TData = sig
   type t
 
   val create : int -> t
-  val size : t -> int
   val close : t -> unit
   val get : t -> int -> int
   val set : t -> int -> int -> unit
-  val set_batch : t -> (int * int) list -> unit
   val mem : t -> int -> bool
 end
 
-module Data (D : TData) = struct
-  include D
+(* Collatz dataset generator *)
+module Dataset : sig
+  include TData
+
+  val set_batch :
+    t -> int -> (int, Bigarray.int16_signed_elt, Bigarray.c_layout) G.t -> unit
+
+  val var_mean : t -> int -> float * float
+  val csv : t -> string -> unit
+end = struct
+  type t = (Int.t, Int.t, [ `Uni ]) Lmdb.Map.t * Env.t * int * int
+
+  let create (size : int) : t =
+    let map_size = 1099511627776 in
+    (* 1TB, see LMDB for doc *)
+    let str =
+      if Sys.file_exists "/tmp/dataset.db" then
+        "Opening the existing dataset..."
+      else
+        Printf.sprintf "Creating the dataset with initial size of %s"
+          (Helpers.bytes_to_string map_size)
+    in
+    Log.warn "%s" str;
+
+    let env =
+      Env.(
+        create Rw ~flags:Flags.no_subdir "/tmp/dataset.db" ~map_size ~max_maps:1)
+    in
+
+    let map =
+      Map.(create Nodup ~key:Conv.int32_le_as_int ~value:Conv.int32_le_as_int)
+        env
+    in
+    (map, env, size, map_size)
+
+  let size ((_, _, n, _) : t) = n
+
+  let close (data : t) : unit =
+    let _, env, _, _ = data in
+    Env.close env
+
+  let get (data : t) (i : int) : int =
+    let map, _, _, _ = data in
+    Map.get map i
+
+  let set (data : t) (i : int) (value : int) : unit =
+    let map, _, _, _ = data in
+    Map.set map i value
+
+  let set_batch (data : t) (size : int)
+      (batch : (int, Bigarray.int16_signed_elt, Bigarray.c_layout) G.t) : unit =
+    let map, env, _, _ = data in
+    let rw = Lmdb.Rw in
+    let transaction txn =
+      for i = 0 to size - 1 do
+        let v = G.get batch i in
+        Map.set map ~txn ~flags:Map.Flags.none i v
+      done;
+      ()
+    in
+    let r = Txn.go rw env (fun txn -> transaction txn) in
+    match r with
+    | None ->
+        Log.fatal "[Dataset] Error while setting batch. Transaction aborted"
+    | Some _ -> ()
+
+  let mem (data : t) i =
+    let map, _, _, _ = data in
+    try Map.get map i <> 0 with _ -> false
 
   (* Reference: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm *)
   let partial (data : t) start len =
@@ -142,66 +209,11 @@ module Data (D : TData) = struct
     close_out oc
 end
 
-(* Collatz dataset generator *)
-module Dataset = Data (struct
-  type t = (Int.t, Int.t, [ `Uni ]) Lmdb.Map.t * Env.t * int * int
+module Memory : sig
+  include TData
 
-  let create (size : int) : t =
-    let map_size = 1099511627776 in
-    (* 1TB, see LMDB for doc *)
-    let str =
-      if Sys.file_exists "/tmp/dataset.db" then
-        "Opening the existing dataset..."
-      else
-        Printf.sprintf "Creating the dataset with initial size of %s"
-          (Helpers.bytes_to_string map_size)
-    in
-    Log.warn "%s" str;
-
-    let env =
-      Env.(
-        create Rw ~flags:Flags.no_subdir "/tmp/dataset.db" ~map_size ~max_maps:1)
-    in
-
-    let map =
-      Map.(create Nodup ~key:Conv.int32_le_as_int ~value:Conv.int32_le_as_int)
-        env
-    in
-    (map, env, size, map_size)
-
-  let size ((_, _, n, _) : t) = n
-
-  let close (data : t) : unit =
-    let _, env, _, _ = data in
-    Env.close env
-
-  let get (data : t) (i : int) : int =
-    let map, _, _, _ = data in
-    Map.get map i
-
-  let set (data : t) (i : int) (value : int) : unit =
-    let map, _, _, _ = data in
-    Map.set map i value
-
-  let set_batch (data : t) (batch : (int * int) list) : unit =
-    let map, env, _, _ = data in
-    let rw = Lmdb.Rw in
-    let transaction txn =
-      List.iter (fun (i, v) -> Map.set map ~txn ~flags:Map.Flags.none i v) batch;
-      ()
-    in
-    let r = Txn.go rw env (fun txn -> transaction txn) in
-    match r with
-    | None ->
-        Log.fatal "[Dataset] Error while setting batch. Transaction aborted"
-    | Some _ -> ()
-
-  let mem (data : t) i =
-    let map, _, _, _ = data in
-    try Map.get map i <> 0 with _ -> false
-end)
-
-module Memory = Data (struct
+  val raw : t -> (int, Bigarray.int16_signed_elt, Bigarray.c_layout) G.t
+end = struct
   type shard = {
     shard_size : int;
     mutexes : Mutex.t Array.t;
@@ -230,6 +242,7 @@ module Memory = Data (struct
     min (i / shard.shard_size) (Array.length shard.mutexes - 1)
 
   let size (data : t) = (fst data).total_size
+  let raw (data : t) = snd data
   let close _ = ()
 
   let get (data : t) (i : int) : int =
@@ -253,16 +266,8 @@ module Memory = Data (struct
     G.set (snd data) i value;
     Mutex.unlock mutex
 
-  let set_batch (data : t) (batch : (int * int) list) =
-    let sorted_batch =
-      List.sort
-        (fun (i1, _) (i2, _) -> compare (index data i1) (index data i2))
-        batch
-    in
-    List.iter (fun (i, v) -> set data i v) sorted_batch
-
   let mem (data : t) (i : int) = i < size data && get data i <> 0
-end)
+end
 
 let compute_collatz (size : int) =
   let min_size = min size max_array_size in
@@ -297,35 +302,29 @@ let compute_collatz (size : int) =
       3 + collatz n' delta
   in
 
-  let process f =
+  let process () =
     let progress = Progress.create size in
     for iter = 0 to niter - 1 do
       let delta = min_size * iter in
       let ub = min (min_size - 1) (size - delta) in
       let pool = Task.setup_pool ~num_domains () in
 
-      let results = Array.make (ub + 1) [] in
-
       Task.run pool (fun _ ->
           Task.parallel_for pool ~start:0 ~finish:(ub - 1) ~body:(fun i ->
               let v = collatz (delta + i + 1) delta in
               Memory.set memory i v;
-              results.(i) <- [ (delta + i + 1, v) ];
-              Progress.add progress;
-              f 1));
+              Progress.add progress));
 
-      let batch =
-        Array.fold_left (fun acc b -> List.rev_append b acc) [] results
-      in
       Task.teardown_pool pool;
       Progress.finish progress;
 
-      Dataset.set_batch db batch;
+      Dataset.set_batch db ub (Memory.raw memory);
       Gc.full_major ()
     done
   in
 
-  process (fun _ -> ());
+  process ();
+  Gc.full_major ();
   (memory, db)
 
 let generate (size : int) (output : string option) =
