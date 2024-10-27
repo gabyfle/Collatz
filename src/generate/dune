@@ -1,0 +1,5 @@
+(library
+ (name generate)
+ (libraries lmdb owl domainslib helpers progress)
+ (modules generate)
+ (wrapped false))

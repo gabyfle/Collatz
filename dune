@@ -8,7 +8,7 @@
 
 (executable
  (name collatz)
- (libraries lmdb owl domainslib cmdliner)
+ (libraries generate helpers progress cmdliner)
  (modes native)
  (ocamlopt_flags
   (:standard -O3)))
